@@ -6,11 +6,11 @@ import csv
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QMessageBox, QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QFrame,
+    QMessageBox, QDialog, QFormLayout, QSpinBox, QFrame,
     QHeaderView, QFileDialog, QStackedWidget, QTextEdit, QAbstractItemView,
     QListWidget, QListWidgetItem, QDateEdit, QTimeEdit, QScrollArea
 )
-from PyQt6.QtCore import Qt, QPoint, QDate, QTime, QSize, QSizeF, QMarginsF
+from PyQt6.QtCore import Qt, QDate, QTime, QSizeF, QMarginsF, QEvent
 from PyQt6.QtGui import QFont, QTextDocument, QPageSize, QPageLayout, QColor, QIcon
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 
@@ -31,35 +31,33 @@ def cat_abbr(cat):
 
 # ---------- Resource Path Helper (for PyInstaller) ----------
 def resource_path(relative_path):
-    """Get absolute path to resource, works for dev and for PyInstaller"""
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
 # ---------- Database ----------
-def init_db():
-    # Use persistent DB location next to the exe (not in temp folder)
+def get_db_path():
     if getattr(sys, 'frozen', False):
         db_dir = os.path.dirname(sys.executable)
     else:
         db_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(db_dir, DB_NAME)
-    
-    conn = sqlite3.connect(db_path)
+    return os.path.join(db_dir, DB_NAME)
+
+def init_db():
+    conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS medicines (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        category TEXT, price REAL NOT NULL, stock INTEGER NOT NULL)''')
+        category TEXT, price INTEGER NOT NULL, stock INTEGER NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS invoices (
         id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_no TEXT UNIQUE,
-        customer_name TEXT, date TEXT, time TEXT, subtotal REAL,
-        discount REAL, grand_total REAL, cash_paid REAL, change_amount REAL)''')
+        customer_name TEXT, date TEXT, time TEXT, subtotal INTEGER,
+        discount INTEGER, grand_total INTEGER, cash_paid INTEGER, change_amount INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS invoice_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id INTEGER,
-        medicine_name TEXT, qty INTEGER, price REAL, amount REAL,
+        medicine_name TEXT, qty INTEGER, price INTEGER, amount INTEGER,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE)''')
     conn.commit()
     cur = conn.cursor()
@@ -69,14 +67,6 @@ def init_db():
         cur.execute("ALTER TABLE invoice_items ADD COLUMN category TEXT")
         conn.commit()
     conn.close()
-
-# Override DB_NAME usage to always point to persistent location
-def get_db_path():
-    if getattr(sys, 'frozen', False):
-        db_dir = os.path.dirname(sys.executable)
-    else:
-        db_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(db_dir, DB_NAME)
 
 init_db()
 
@@ -104,11 +94,11 @@ QLabel#SectionLabel { color: #64748B; font-size: 12px; font-weight: 600; }
 QLabel#StatValue { font-size: 28px; font-weight: 700; color: #1B2A41; }
 QLabel#StatTitle { color: #64748B; font-size: 12px; font-weight: 600; }
 QFrame#Panel, QFrame#StatCard { background-color: #FFFFFF; border: 1px solid #E4E8EE; border-radius: 10px; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTimeEdit {
+QLineEdit, QComboBox, QSpinBox, QDateEdit, QTimeEdit {
     padding: 10px 12px; border: 1px solid #D6DEE7; border-radius: 6px;
     background-color: #FFFFFF; font-size: 14px; color: #2C3E50;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus,
 QDateEdit:focus, QTimeEdit:focus { border: 1px solid #3B82F6; }
 QPushButton {
     background-color: #3B82F6; color: white; border: none;
@@ -182,9 +172,13 @@ class MedicineDialog(QDialog):
         self.name_input.setPlaceholderText("e.g. Panadol 500mg")
         self.cat_input = QComboBox()
         self.cat_input.addItems(["Tablet", "Syrup", "Injection", "Capsule", "Other"])
-        self.price_input = QDoubleSpinBox()
-        self.price_input.setMaximum(999999); self.price_input.setDecimals(2); self.price_input.setPrefix("Rs. ")
-        self.stock_input = QSpinBox(); self.stock_input.setMaximum(999999)
+        # Price: min 1 so user MUST enter a value
+        self.price_input = QSpinBox()
+        self.price_input.setRange(1, 9999999)
+        self.price_input.setSpecialValueText(" ")
+        # Stock: min 0 (0 is valid for out-of-stock)
+        self.stock_input = QSpinBox()
+        self.stock_input.setRange(0, 999999)
         form.addRow("Name", self.name_input)
         form.addRow("Category", self.cat_input)
         form.addRow("Price", self.price_input)
@@ -194,7 +188,8 @@ class MedicineDialog(QDialog):
         if self.data:
             self.name_input.setText(self.data[1])
             self.cat_input.setCurrentText(self.data[2])
-            self.price_input.setValue(float(self.data[3]))
+            p = int(float(self.data[3])) if self.data[3] else 1
+            self.price_input.setValue(max(1, p))
             self.stock_input.setValue(int(self.data[4]))
 
         layout.addStretch()
@@ -207,16 +202,18 @@ class MedicineDialog(QDialog):
     def save_data(self):
         if not self.name_input.text().strip():
             QMessageBox.warning(self, "Error", "Medicine name is required."); return
+        if self.price_input.value() < 1:
+            QMessageBox.warning(self, "Error", "Price must be at least 1."); return
         try:
             conn = sqlite3.connect(get_db_path()); cur = conn.cursor()
             if self.data:
                 cur.execute("UPDATE medicines SET name=?,category=?,price=?,stock=? WHERE id=?",
-                            (self.name_input.text(), self.cat_input.currentText(),
-                             self.price_input.value(), self.stock_input.value(), self.data[0]))
+                            (self.name_input.text().strip(), self.cat_input.currentText(),
+                             int(self.price_input.value()), int(self.stock_input.value()), self.data[0]))
             else:
                 cur.execute("INSERT INTO medicines (name,category,price,stock) VALUES (?,?,?,?)",
-                            (self.name_input.text(), self.cat_input.currentText(),
-                             self.price_input.value(), self.stock_input.value()))
+                            (self.name_input.text().strip(), self.cat_input.currentText(),
+                             int(self.price_input.value()), int(self.stock_input.value())))
             conn.commit(); conn.close(); self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -231,9 +228,10 @@ class PriceEditDialog(QDialog):
         v = QVBoxLayout(self); v.setContentsMargins(25, 25, 25, 25); v.setSpacing(12)
         lbl = QLabel(f"New price for {name}"); lbl.setStyleSheet("font-weight: 600; font-size: 14px;")
         v.addWidget(lbl)
-        self.price_input = QDoubleSpinBox()
-        self.price_input.setMaximum(999999); self.price_input.setDecimals(2); self.price_input.setPrefix("Rs. ")
-        self.price_input.setValue(current_price); self.price_input.setStyleSheet("font-size: 16px; padding: 10px;")
+        self.price_input = QSpinBox()
+        self.price_input.setRange(1, 9999999)
+        self.price_input.setValue(max(1, int(current_price)))
+        self.price_input.setStyleSheet("font-size: 16px; padding: 10px;")
         v.addWidget(self.price_input)
         btns = QHBoxLayout()
         cancel = QPushButton("Cancel"); cancel.setObjectName("Neutral"); cancel.clicked.connect(self.reject)
@@ -242,7 +240,7 @@ class PriceEditDialog(QDialog):
         v.addLayout(btns)
 
     def value(self):
-        return self.price_input.value()
+        return int(self.price_input.value())
 
 # ---------- Invoice Dialog (History) ----------
 class InvoiceDialog(QDialog):
@@ -272,7 +270,7 @@ class InvoiceDialog(QDialog):
         header.setStyleSheet("color: #1B2A41;")
         layout.addWidget(header)
 
-        info = QLabel(f"Customer: {self.inv[2]}    Date: {self.inv[3]} {self.inv[4]}")
+        info = QLabel(f"Customer: {self.inv[2] or 'Walk-in'}    Date: {self.inv[3]} {self.inv[4]}")
         info.setStyleSheet("color: #94A3B8; font-size: 13px;")
         layout.addWidget(info)
 
@@ -290,15 +288,15 @@ class InvoiceDialog(QDialog):
             it_t = QTableWidgetItem(cat_abbr(item[4])); it_t.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             it_n = QTableWidgetItem(item[0])
             it_q = QTableWidgetItem(str(item[1])); it_q.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            it_p = QTableWidgetItem(f"{item[2]:.2f}"); it_p.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            it_a = QTableWidgetItem(f"{item[3]:.2f}"); it_a.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            it_p = QTableWidgetItem(f"{int(item[2])}"); it_p.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            it_a = QTableWidgetItem(f"{int(item[3])}"); it_a.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             table.setItem(i-1, 0, it_s); table.setItem(i-1, 1, it_t); table.setItem(i-1, 2, it_n)
             table.setItem(i-1, 3, it_q); table.setItem(i-1, 4, it_p); table.setItem(i-1, 5, it_a)
         layout.addWidget(table)
 
         totals = QLabel(
-            f"Subtotal: Rs. {self.inv[5]:.2f}     Discount: Rs. {self.inv[6]:.2f}     "
-            f"Grand Total: Rs. {self.inv[7]:.2f}     Change: Rs. {self.inv[9]:.2f}"
+            f"Subtotal: Rs. {int(self.inv[5])}     Discount: Rs. {int(self.inv[6])}     "
+            f"Grand Total: Rs. {int(self.inv[7])}     Change: Rs. {int(self.inv[9])}"
         )
         totals.setStyleSheet("font-size: 13px; font-weight: 600; padding: 12px; "
                              "background: #F7F9FC; border-radius: 6px; color: #1B2A41;")
@@ -356,17 +354,22 @@ def build_receipt_text(inv, items):
             cat = cat_abbr(it[4] if len(it) > 4 else "")
             if len(name) > 16:
                 name = name[:15] + "."
-            L.append(f"{i:<3}{cat:<4}{name:<17}{qty:>4}{price:>6.0f}{amount:>8.2f}")
+            L.append(f"{i:<3}{cat:<4}{name:<17}{qty:>4}{int(price):>6}{int(amount):>8}")
     else:
         L.append("  (no items)")
     L.append("-" * 42)
-    L.append(f"{'Subtotal:':<30}{subtotal:>12.2f}")
-    L.append(f"{'Discount:':<30}{discount:>12.2f}")
+    L.append(f"{'Subtotal:':<30}{('Rs.' + str(int(subtotal))):>12}")
+    L.append(f"{'Discount:':<30}{('Rs.' + str(int(discount))):>12}")
     L.append("=" * 42)
-    L.append(f"{'GRAND TOTAL:':<30}{('Rs.' + format(grand, '.2f')):>12}")
+    L.append(f"{'GRAND TOTAL:':<30}{('Rs.' + str(int(grand))):>12}")
     L.append("=" * 42)
-    L.append(f"{'Cash:':<30}{cash:>12.2f}")
-    L.append(f"{'Change:':<30}{change:>12.2f}")
+    # Only show cash/change if cash was actually entered
+    if int(cash) > 0:
+        L.append(f"{'Cash:':<30}{('Rs.' + str(int(cash))):>12}")
+        L.append(f"{'Change:':<30}{('Rs.' + str(int(change))):>12}")
+    else:
+        L.append(f"{'Cash:':<30}{'—':>12}")
+        L.append(f"{'Change:':<30}{'—':>12}")
     L.append("=" * 42)
     L.append("      Thank you for your visit!")
     L.append("           Stay Healthy!")
@@ -481,51 +484,80 @@ class PrintPreviewDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Print Error", str(e))
 
-# ---------- Search Input ----------
+# ---------- Search Input (Inline Results — Focus-Safe) ----------
 class SearchInput(QWidget):
+    """Inline search: results appear directly below the input in the same
+    layout. The QLineEdit keeps keyboard focus so the user can type
+    continuously without interruption."""
+
     def __init__(self, on_select_callback, parent=None):
         super().__init__(parent)
         self.on_select = on_select_callback
         self.results = []
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
         self.input = QLineEdit()
         self.input.setPlaceholderText("Type medicine name...")
         self.input.textChanged.connect(self.on_text_changed)
         self.input.returnPressed.connect(self.select_first)
+        self.input.installEventFilter(self)
         layout.addWidget(self.input)
-        self.popup = QListWidget(self)
-        self.popup.setWindowFlags(Qt.WindowType.Popup)
-        self.popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.popup.itemClicked.connect(self.on_item_clicked)
-        self.popup.hide()
+
+        self.results_list = QListWidget()
+        self.results_list.setMaximumHeight(220)
+        self.results_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.results_list.itemClicked.connect(self.on_item_clicked)
+        self.results_list.hide()
+        layout.addWidget(self.results_list)
+
+        self.layout = layout
+
+    def eventFilter(self, obj, event):
+        # Hide list when search input loses focus (but not when clicking on the list)
+        if obj is self.input and event.type() == QEvent.Type.FocusOut:
+            # Small delay so the click on results_list registers first
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(150, self._maybe_hide_list)
+        if obj is self.input and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self.input.clear()
+                self.results_list.hide()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _maybe_hide_list(self):
+        if not self.results_list.underMouse():
+            self.results_list.hide()
 
     def on_text_changed(self, text):
         text = text.strip()
         if not text:
-            self.popup.hide(); return
+            self.results_list.hide()
+            return
         try:
             conn = sqlite3.connect(get_db_path()); cur = conn.cursor()
             cur.execute("SELECT id, name, price, stock, category FROM medicines "
-                        "WHERE name LIKE ? AND stock > 0 ORDER BY name LIMIT 8", (f"%{text}%",))
+                        "WHERE name LIKE ? ORDER BY name LIMIT 10",
+                        (f"%{text}%",))
             rows = cur.fetchall(); conn.close()
         except Exception:
             rows = []
         self.results = rows
-        self.popup.clear()
+        self.results_list.clear()
         if not rows:
-            self.popup.hide(); return
+            self.results_list.hide()
+            return
         for r in rows:
             abbr = cat_abbr(r[4])
-            display = f"{r[1]}  ({abbr})    Rs. {r[2]:.2f}    Stock: {r[3]}"
+            display = f"{r[1]}  ({abbr})    Rs. {int(r[2])}    Stock: {r[3]}"
             item = QListWidgetItem(display)
             item.setData(Qt.ItemDataRole.UserRole, r)
-            self.popup.addItem(item)
-        pos = self.input.mapToGlobal(QPoint(0, self.input.height()))
-        self.popup.move(pos)
-        self.popup.setFixedWidth(self.input.width())
-        self.popup.setFixedHeight(min(len(rows) * 34 + 8, 260))
-        self.popup.show(); self.popup.raise_()
+            self.results_list.addItem(item)
+        self.results_list.show()
+        # CRITICAL: keep focus on the input so typing continues
+        self.input.setFocus()
 
     def select_first(self):
         if self.results:
@@ -537,7 +569,10 @@ class SearchInput(QWidget):
             self.emit_selection(data)
 
     def emit_selection(self, data):
-        self.popup.hide(); self.input.clear(); self.on_select(data)
+        self.results_list.hide()
+        self.input.clear()
+        self.input.setFocus()
+        self.on_select(data)
 
 # =========================================================
 # MAIN WINDOW
@@ -551,12 +586,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
         self.cart = []
         self.editing_invoice_id = None
-        
-        # Set the application window icon
+
         icon_path = resource_path("logo.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-        
+
         self.setup_ui()
 
     def setup_ui(self):
@@ -613,7 +647,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(title); layout.addWidget(sub)
 
         cards_row = QHBoxLayout(); cards_row.setSpacing(16)
-        self.card_sales = self._make_stat_card("Today's Sales", "Rs. 0.00")
+        self.card_sales = self._make_stat_card("Today's Sales", "Rs. 0")
         self.card_invoices = self._make_stat_card("Invoices Today", "0")
         self.card_low = self._make_stat_card("Low Stock Items", "0")
         self.card_total_meds = self._make_stat_card("Total Medicines", "0")
@@ -664,13 +698,13 @@ class MainWindow(QMainWindow):
             today = datetime.date.today().strftime("%Y-%m-%d")
             cur.execute("SELECT SUM(grand_total), COUNT(id) FROM invoices WHERE date=?", (today,))
             res = cur.fetchone()
-            sales = res[0] if res[0] else 0.0
+            sales = res[0] if res[0] else 0
             inv = res[1] if res[1] else 0
             cur.execute("SELECT COUNT(id) FROM medicines WHERE stock < 10")
             low = cur.fetchone()[0]
             cur.execute("SELECT COUNT(id) FROM medicines")
             total_meds = cur.fetchone()[0]
-            self.card_sales.value_label.setText(f"Rs. {sales:.2f}")
+            self.card_sales.value_label.setText(f"Rs. {int(sales)}")
             self.card_invoices.value_label.setText(str(inv))
             self.card_low.value_label.setText(str(low))
             self.card_total_meds.value_label.setText(str(total_meds))
@@ -681,7 +715,7 @@ class MainWindow(QMainWindow):
                 self.recent_table.setItem(i, 0, QTableWidgetItem(r[0]))
                 self.recent_table.setItem(i, 1, QTableWidgetItem(r[1] or "Walk-in"))
                 self.recent_table.setItem(i, 2, QTableWidgetItem(r[2]))
-                self.recent_table.setItem(i, 3, QTableWidgetItem(f"Rs. {r[3]:.2f}"))
+                self.recent_table.setItem(i, 3, QTableWidgetItem(f"Rs. {int(r[3])}"))
         except Exception as e:
             print(e)
 
@@ -705,6 +739,7 @@ class MainWindow(QMainWindow):
 
         content = QHBoxLayout(); content.setSpacing(16)
 
+        # LEFT
         left = QFrame(); left.setObjectName("Panel")
         lv = QVBoxLayout(left); lv.setContentsMargins(20, 20, 20, 20); lv.setSpacing(12)
         lbl = QLabel("Search Medicine"); lbl.setObjectName("SectionLabel"); lv.addWidget(lbl)
@@ -713,14 +748,15 @@ class MainWindow(QMainWindow):
         lbl2 = QLabel("Cart — double-click Rate to edit price, double-click a row to edit quantity")
         lbl2.setObjectName("SectionLabel"); lv.addWidget(lbl2)
 
-        self.cart_table = QTableWidget(0, 6)
-        self.cart_table.setHorizontalHeaderLabels(["Medicine", "Type", "Rate (Rs)", "Qty", "Amount (Rs)", ""])
+        self.cart_table = QTableWidget(0, 5)
+        self.cart_table.setHorizontalHeaderLabels(["Medicine", "Rate (Rs)", "Qty", "Amount (Rs)", ""])
         hv = self.cart_table.horizontalHeader()
         hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in [1, 2, 3, 4, 5]: hv.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
-        self.cart_table.setColumnWidth(1, 55); self.cart_table.setColumnWidth(2, 100)
-        self.cart_table.setColumnWidth(3, 55); self.cart_table.setColumnWidth(4, 110)
-        self.cart_table.setColumnWidth(5, 50)
+        for i in [1, 2, 3, 4]: hv.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
+        self.cart_table.setColumnWidth(1, 100)
+        self.cart_table.setColumnWidth(2, 55)
+        self.cart_table.setColumnWidth(3, 110)
+        self.cart_table.setColumnWidth(4, 50)
         self.cart_table.verticalHeader().setVisible(False)
         self.cart_table.verticalHeader().setDefaultSectionSize(48)
         self.cart_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -749,6 +785,7 @@ class MainWindow(QMainWindow):
         lv.addLayout(qty_row)
         content.addWidget(left, 3)
 
+        # RIGHT
         right = QFrame(); right.setObjectName("Panel")
         rv = QVBoxLayout(right); rv.setContentsMargins(20, 20, 20, 20); rv.setSpacing(12)
         lbl3 = QLabel("Thermal Preview (80mm)"); lbl3.setObjectName("SectionLabel"); rv.addWidget(lbl3)
@@ -757,7 +794,8 @@ class MainWindow(QMainWindow):
 
         form = QGridLayout(); form.setSpacing(10)
         form.addWidget(QLabel("Customer"), 0, 0)
-        self.customer_input = QLineEdit("Walk-in Customer")
+        self.customer_input = QLineEdit()
+        self.customer_input.setPlaceholderText("Customer name")
         self.customer_input.textChanged.connect(self.update_preview)
         form.addWidget(self.customer_input, 0, 1)
 
@@ -773,13 +811,17 @@ class MainWindow(QMainWindow):
         form.addWidget(self.time_input, 1, 3)
 
         form.addWidget(QLabel("Discount"), 1, 0)
-        self.discount_input = QDoubleSpinBox(); self.discount_input.setMaximum(999999)
-        self.discount_input.setPrefix("Rs. "); self.discount_input.valueChanged.connect(self.update_preview)
+        self.discount_input = QSpinBox()
+        self.discount_input.setRange(0, 9999999)
+        self.discount_input.setSpecialValueText(" ")
+        self.discount_input.valueChanged.connect(self.update_preview)
         form.addWidget(self.discount_input, 1, 1)
 
         form.addWidget(QLabel("Cash Paid"), 2, 0)
-        self.cash_input = QDoubleSpinBox(); self.cash_input.setMaximum(999999)
-        self.cash_input.setPrefix("Rs. "); self.cash_input.valueChanged.connect(self.update_preview)
+        self.cash_input = QSpinBox()
+        self.cash_input.setRange(0, 9999999)
+        self.cash_input.setSpecialValueText(" ")
+        self.cash_input.valueChanged.connect(self.update_preview)
         form.addWidget(self.cash_input, 2, 1)
         rv.addLayout(form)
 
@@ -797,9 +839,33 @@ class MainWindow(QMainWindow):
 
     def _add_from_search(self, med_row):
         med_id, name, price, stock, category = med_row
-        self.add_to_cart(med_id, name, price, stock, category)
+        self.add_to_cart(med_id, name, int(price), stock, category)
 
     def add_to_cart(self, med_id, name, price, stock, category=""):
+        # If editing an invoice, add back the qty already in the invoice for this item
+        if self.editing_invoice_id:
+            for existing in self.cart:
+                if existing['id'] == med_id:
+                    # Already in cart, increase qty
+                    if existing['qty'] < existing['stock'] + existing['qty']:
+                        existing['qty'] += 1
+                        existing['amount'] = existing['qty'] * existing['price']
+                    else:
+                        QMessageBox.warning(self, "Stock", f"Only {existing['stock']} available.")
+                    self.refresh_cart(); return
+            # Check if this medicine was in the original invoice
+            try:
+                conn = sqlite3.connect(get_db_path()); cur = conn.cursor()
+                cur.execute("""SELECT ii.qty FROM invoice_items ii
+                               JOIN invoices i ON ii.invoice_id = i.id
+                               WHERE i.id=? AND ii.medicine_name=?""",
+                            (self.editing_invoice_id, name))
+                row = cur.fetchone(); conn.close()
+                if row:
+                    stock += row[0]  # add back the qty being edited
+            except Exception:
+                pass
+
         for item in self.cart:
             if item['id'] == med_id:
                 if item['qty'] < stock:
@@ -807,8 +873,8 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.warning(self, "Stock", f"Only {stock} available.")
                 self.refresh_cart(); return
-        self.cart.append({'id': med_id, 'name': name, 'price': price, 'qty': 1,
-                          'amount': price, 'stock': stock, 'category': category})
+        self.cart.append({'id': med_id, 'name': name, 'price': int(price), 'qty': 1,
+                          'amount': int(price), 'stock': stock, 'category': category})
         self.refresh_cart()
 
     def refresh_cart(self):
@@ -818,19 +884,19 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem(item['name'])
             name_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.cart_table.setItem(i, 0, name_item)
-            type_item = QTableWidgetItem(cat_abbr(item.get('category', '')))
-            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            type_item.setForeground(QColor("#64748B"))
-            self.cart_table.setItem(i, 1, type_item)
-            rate_item = QTableWidgetItem(f"{item['price']:.2f}")
+
+            rate_item = QTableWidgetItem(f"{int(item['price'])}")
             rate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.cart_table.setItem(i, 2, rate_item)
+            self.cart_table.setItem(i, 1, rate_item)
+
             qty_item = QTableWidgetItem(str(item['qty'])); qty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.cart_table.setItem(i, 3, qty_item)
-            amt_item = QTableWidgetItem(f"{item['amount']:.2f}")
+            self.cart_table.setItem(i, 2, qty_item)
+
+            amt_item = QTableWidgetItem(f"{int(item['amount'])}")
             amt_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             f = QFont(); f.setBold(True); amt_item.setFont(f)
-            self.cart_table.setItem(i, 4, amt_item)
+            self.cart_table.setItem(i, 3, amt_item)
+
             btn = QPushButton("✕"); btn.setFixedSize(28, 28)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet("""
@@ -839,14 +905,14 @@ class MainWindow(QMainWindow):
                 QPushButton:hover { background-color: #EF4444; color: white; }
             """)
             btn.clicked.connect(lambda checked, it=item: self.remove_specific(it))
-            self.cart_table.setCellWidget(i, 5, btn)
+            self.cart_table.setCellWidget(i, 4, btn)
         self.update_preview()
 
     def _on_cart_double_click(self, index):
         row = index.row(); col = index.column()
         if row < 0 or row >= len(self.cart): return
         item = self.cart[row]
-        if col == 2:
+        if col == 1:
             dlg = PriceEditDialog(self, item['name'], item['price'])
             if dlg.exec():
                 item['price'] = dlg.value(); item['amount'] = item['qty'] * item['price']
@@ -915,7 +981,7 @@ class MainWindow(QMainWindow):
     def clear_cart(self):
         if self.cart and QMessageBox.question(self, "Clear", "Remove all items?") == QMessageBox.StandardButton.Yes:
             self.cart.clear(); self.discount_input.setValue(0); self.cash_input.setValue(0)
-            self.customer_input.setText("Walk-in Customer")
+            self.customer_input.clear()
             self.date_input.setDate(QDate.currentDate()); self.time_input.setTime(QTime.currentTime())
             self.refresh_cart()
 
@@ -926,12 +992,12 @@ class MainWindow(QMainWindow):
         cash = self.cash_input.value()
         change = cash - grand if cash >= grand else 0
         rno = f"INV-{datetime.datetime.now().strftime('%y%m%d%H%M%S')}"
-        cust = self.customer_input.text() or "Walk-in"
+        cust = self.customer_input.text().strip() or "Walk-in"
         date_str = self.date_input.date().toString("dd-MMM-yyyy")
         time_str = self.time_input.time().toString("HH:mm")
-        items = [(it['name'], it['qty'], it['price'], it['amount'], it.get('category', ''))
+        items = [(it['name'], it['qty'], int(it['price']), int(it['amount']), it.get('category', ''))
                  for it in self.cart]
-        inv_like = (0, rno, cust, date_str, time_str, subtotal, discount, grand, cash, change)
+        inv_like = (0, rno, cust, date_str, time_str, int(subtotal), int(discount), int(grand), int(cash), int(change))
         return build_receipt_text(inv_like, items)
 
     def update_preview(self):
@@ -946,7 +1012,7 @@ class MainWindow(QMainWindow):
         cash = self.cash_input.value() if self.cash_input.value() > 0 else grand
         if cash < grand:
             QMessageBox.critical(self, "Error", "Cash paid is less than total."); return
-        cust = self.customer_input.text() or "Walk-in Customer"
+        cust = self.customer_input.text().strip() or "Walk-in Customer"
         date_str = self.date_input.date().toString("dd-MMM-yyyy")
         time_str = self.time_input.time().toString("HH:mm")
         try:
@@ -959,16 +1025,16 @@ class MainWindow(QMainWindow):
                 cur.execute("""UPDATE invoices SET customer_name=?, date=?, time=?,
                                 subtotal=?, discount=?, grand_total=?, cash_paid=?, change_amount=?
                                 WHERE id=?""",
-                            (cust, date_str, time_str, subtotal, discount, grand, cash,
-                             cash - grand, self.editing_invoice_id))
+                            (cust, date_str, time_str, int(subtotal), int(discount), int(grand), int(cash),
+                             int(cash - grand), self.editing_invoice_id))
                 inv_id = self.editing_invoice_id
                 cur.execute("DELETE FROM invoice_items WHERE invoice_id=?", (inv_id,))
                 for item in self.cart:
                     cur.execute("""INSERT INTO invoice_items
                                     (invoice_id,medicine_name,qty,price,amount,category)
                                     VALUES (?,?,?,?,?,?)""",
-                                (inv_id, item['name'], item['qty'], item['price'],
-                                 item['amount'], item.get('category', '')))
+                                (inv_id, item['name'], item['qty'], int(item['price']),
+                                 int(item['amount']), item.get('category', '')))
                     cur.execute("UPDATE medicines SET stock = stock - ? WHERE id=?", (item['qty'], item['id']))
                 conn.commit(); conn.close()
             else:
@@ -976,14 +1042,14 @@ class MainWindow(QMainWindow):
                 cur.execute("""INSERT INTO invoices (receipt_no,customer_name,date,time,
                                 subtotal,discount,grand_total,cash_paid,change_amount)
                                 VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (rno, cust, date_str, time_str, subtotal, discount, grand, cash, cash - grand))
+                            (rno, cust, date_str, time_str, int(subtotal), int(discount), int(grand), int(cash), int(cash - grand)))
                 inv_id = cur.lastrowid
                 for item in self.cart:
                     cur.execute("""INSERT INTO invoice_items
                                     (invoice_id,medicine_name,qty,price,amount,category)
                                     VALUES (?,?,?,?,?,?)""",
-                                (inv_id, item['name'], item['qty'], item['price'],
-                                 item['amount'], item.get('category', '')))
+                                (inv_id, item['name'], item['qty'], int(item['price']),
+                                 int(item['amount']), item.get('category', '')))
                     cur.execute("UPDATE medicines SET stock = stock - ? WHERE id=?", (item['qty'], item['id']))
                 conn.commit(); conn.close()
 
@@ -994,13 +1060,23 @@ class MainWindow(QMainWindow):
             items = cur.fetchall(); conn.close()
 
             preview_dlg = PrintPreviewDialog(self, inv, items); preview_dlg.exec()
-            self.clear_cart()
-            self.editing_invoice_id = None
-            self.cancel_edit_btn.setVisible(False)
-            self.invoice_title.setText("New Invoice")
-            self.invoice_sub.setText("Search medicines, adjust quantity or price, and print your invoice")
+            self._reset_invoice_form()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+
+    def _reset_invoice_form(self):
+        """Reset all invoice fields to empty/new state."""
+        self.cart = []
+        self.refresh_cart()
+        self.editing_invoice_id = None
+        self.cancel_edit_btn.setVisible(False)
+        self.customer_input.clear()
+        self.discount_input.setValue(0)
+        self.cash_input.setValue(0)
+        self.date_input.setDate(QDate.currentDate())
+        self.time_input.setTime(QTime.currentTime())
+        self.invoice_title.setText("New Invoice")
+        self.invoice_sub.setText("Search medicines, adjust quantity or price, and print your invoice")
 
     def load_invoice_for_edit(self, invoice_id):
         try:
@@ -1016,16 +1092,20 @@ class MainWindow(QMainWindow):
                 conn = sqlite3.connect(get_db_path()); cur = conn.cursor()
                 cur.execute("SELECT id, stock FROM medicines WHERE name=?", (name,))
                 row = cur.fetchone(); conn.close()
-                if row: med_id, stock = row
-                else: med_id, stock = -1, qty
+                if row:
+                    med_id, stock = row
+                else:
+                    med_id, stock = -1, qty
+                # Add back the qty being edited so user can re-add up to original + current stock
+                stock = stock + qty
                 if not category:
                     conn = sqlite3.connect(get_db_path()); cur = conn.cursor()
                     cur.execute("SELECT category FROM medicines WHERE name=?", (name,))
                     cat_row = cur.fetchone(); conn.close()
                     if cat_row and cat_row[0]: category = cat_row[0]
-                self.cart.append({'id': med_id, 'name': name, 'price': price, 'qty': qty,
-                                  'amount': amount, 'stock': stock, 'category': category or ''})
-            self.customer_input.setText(inv[2])
+                self.cart.append({'id': med_id, 'name': name, 'price': int(price), 'qty': qty,
+                                  'amount': int(amount), 'stock': stock, 'category': category or ''})
+            self.customer_input.setText(inv[2] if inv[2] else "")
             try:
                 d = datetime.datetime.strptime(inv[3], "%d-%b-%Y")
                 self.date_input.setDate(QDate(d.year, d.month, d.day))
@@ -1040,7 +1120,7 @@ class MainWindow(QMainWindow):
                 self.time_input.setTime(QTime(t.hour, t.minute))
             except Exception:
                 self.time_input.setTime(QTime.currentTime())
-            self.discount_input.setValue(inv[6]); self.cash_input.setValue(inv[8])
+            self.discount_input.setValue(int(inv[6])); self.cash_input.setValue(int(inv[8]))
             self.refresh_cart()
             self.cancel_edit_btn.setVisible(True)
             self.invoice_title.setText(f"Editing Invoice {inv[1]}")
@@ -1051,14 +1131,7 @@ class MainWindow(QMainWindow):
 
     def cancel_edit_mode(self):
         if QMessageBox.question(self, "Cancel", "Discard changes to this invoice?") == QMessageBox.StandardButton.Yes:
-            self.editing_invoice_id = None
-            self.cart = []; self.refresh_cart()
-            self.customer_input.setText("Walk-in Customer")
-            self.discount_input.setValue(0); self.cash_input.setValue(0)
-            self.date_input.setDate(QDate.currentDate()); self.time_input.setTime(QTime.currentTime())
-            self.cancel_edit_btn.setVisible(False)
-            self.invoice_title.setText("New Invoice")
-            self.invoice_sub.setText("Search medicines, adjust quantity or price, and print your invoice")
+            self._reset_invoice_form()
 
     # =========================================================
     # INVENTORY PAGE
@@ -1107,7 +1180,7 @@ class MainWindow(QMainWindow):
                 self.inv_table.setItem(i, 0, QTableWidgetItem(str(r[0])))
                 self.inv_table.setItem(i, 1, QTableWidgetItem(r[1]))
                 self.inv_table.setItem(i, 2, QTableWidgetItem(r[2] or ""))
-                self.inv_table.setItem(i, 3, QTableWidgetItem(f"{r[3]:.2f}"))
+                self.inv_table.setItem(i, 3, QTableWidgetItem(f"{int(r[3])}"))
                 self.inv_table.setItem(i, 4, QTableWidgetItem(str(r[4])))
         except Exception as e:
             print(e)
@@ -1199,7 +1272,7 @@ class MainWindow(QMainWindow):
                 self.hist_table.setItem(i, 2, QTableWidgetItem(r[2] or "Walk-in"))
                 self.hist_table.setItem(i, 3, QTableWidgetItem(r[3]))
                 self.hist_table.setItem(i, 4, QTableWidgetItem(r[4]))
-                self.hist_table.setItem(i, 5, QTableWidgetItem(f"Rs. {r[5]:.2f}"))
+                self.hist_table.setItem(i, 5, QTableWidgetItem(f"Rs. {int(r[5])}"))
         except Exception as e:
             print(e)
 
@@ -1219,12 +1292,11 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    
-    # Set application-wide icon
+
     icon_path = resource_path("logo.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
-    
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
